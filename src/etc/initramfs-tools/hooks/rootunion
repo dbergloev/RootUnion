@@ -1,0 +1,26 @@
+#!/bin/sh -e
+
+# Requried by initramfs tools
+[ "$1" = "prereqs" ] &&
+    exit 0
+
+. /usr/share/initramfs-tools/hook-functions
+
+count=0
+
+for mod in overlayfs overlay aufs; do
+    if modprobe -nbq $mod; then
+        manual_add_modules $mod
+
+        count=$((count + 1))
+    fi
+done
+
+if [ $count -eq 0 ]; then
+    echo "E [rootunion]: No union file system modules could be found"
+    echo "E [rootunion]:     Please install either 'aufs', 'overlay' or 'overlayfs'"
+
+    exit 1
+fi
+
+exit 0

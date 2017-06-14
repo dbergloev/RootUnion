@@ -1,0 +1,483 @@
+#!/bin/sh -e
+#
+# /etc/initramfs-tools/scripts/init-bottom/rootunion
+#
+# This script requires the root device to be using 'btrfs' as it makes
+# usage of it's subvolume features. At least two subvolumes are required.
+# One for the original installment (root ro) and one for the writable part
+# (root rw). The 'overlayfs' requries a third for it's 'workdir'. All
+# 2/3 subvolumes must be attached to the main btrfs volume.
+#
+
+# Requried by initramfs tools
+[ "$1" = "prereqs" ] &&
+    exit 0
+
+#
+# ================================================================
+# ----------------------------------------------------------------
+# Some helper functions
+#
+
+printlog() {
+    tag=$1
+    shift
+    input="$@"
+
+    # Bustbox sh (ash) which is packed in ramdisks, escapes white space characters
+    printf '%s\n' "$input" | sed 's/\\n/\n/g' | while read -r line; do
+        echo "$tag $line" | sed 's/\t\|\\t/    /g' | tee -a /run/rootunion.log
+    done
+}
+
+debug() {
+    printlog "D [rootunion]:" $@
+}
+
+log() {
+    printlog "I [rootunion]:" $@
+}
+
+error() {
+    printlog "E [rootunion]:" $@
+
+    [ "$OL_DEBUG" = "1" ] &&
+        spawn
+
+    exit 0
+}
+
+failed() {
+    printlog "PANIC [rootunion]:" $@
+
+    if type panic 2>&1 > /dev/null; then
+        panic
+
+    else
+        spawn
+    fi
+
+    exit $?
+}
+
+devfile() {
+    local dev=$1
+
+    case $dev in
+        LABEL=*)
+            dev="/dev/disk/by-label/${dev#LABEL=}"
+        ;;
+
+        UUID=*)
+            dev="/dev/disk/by-uuid/${dev#UUID=}"
+        ;;
+
+        PARTLABEL=*)
+            dev="/dev/disk/by-partlabel/${dev#PARTLABEL=}"
+        ;;
+
+        PARTUUID=*)
+            dev="/dev/disk/by-partuuid/${dev#PARTUUID=}"
+        ;;
+
+        /dev/*)
+        ;;
+
+        *)
+            dev="/dev/$dev"
+        ;;
+    esac
+
+    if [ -b $dev ]; then
+        echo $dev; return 0
+    fi
+
+    return 1
+}
+
+chkdirs() {
+    for dir in $@; do
+        if [ ! -d "$dir" ]; then
+            debug "\t-> $dir"
+
+            mkdir -p "$dir" ||
+                return 1
+        fi
+    done
+
+    return 0
+}
+
+spawn() {
+    #Spawn a shell without running panic scripts
+
+    [ -x /sbin/usplash_write ] &&
+        /sbin/usplash_write "QUIT"
+
+    chvt 1
+
+    modprobe i8042
+    modprobe atkbd
+
+    PS1='(rootunion) ' /bin/sh -i </dev/console >/dev/console 2>&1
+}
+
+#
+# ================================================================
+# ----------------------------------------------------------------
+# Configuring this script before running
+#
+
+# This is used for testing abilities
+RAMDSKMNT=${ramdskmnt:-}
+ROOTMNT=${RAMDSKMNT}${rootmnt}
+BOOTMNT=${ROOTMNT}/boot
+
+# Get basic functions
+[ -f /scripts/functions ] &&
+    . /scripts/functions
+
+# Let's check to make sure that $ROOTMNT is available and possibly include some configurations
+if [ -z "$ROOTMNT" ] || ! grep -q " $ROOTMNT " /proc/mounts; then
+    error "$ROOTMNT was not available from init-bottom"
+fi
+
+[ -f $ROOTMNT/etc/rootunion.conf ] &&
+    . $ROOTMNT/etc/rootunion.conf
+
+# Get kernel command line arguments
+for arg in $(cat /proc/cmdline); do
+    case $arg in
+        ol-enabled=*)
+            OL_ENABLED=${arg#ol-enabled=}
+        ;;
+
+        ol-reset=*)
+            OL_RESET=${arg#ol-reset=}
+        ;;
+
+        ol-secboot=*)
+            OL_SECBOOT=${arg#ol-secboot=}
+        ;;
+
+        ol-device=*)
+            OL_DEVICE=${arg#ol-device=}
+        ;;
+
+        ol-devargs=*)
+            OL_DEVARGS=${arg#ol-devargs=}
+        ;;
+
+        ol-devprefix=*)
+            OL_DEVPREFIX=${arg#ol-devprefix=}
+        ;;
+
+        ol-driver=*)
+            OL_DRIVER=${arg#ol-driver=}
+        ;;
+
+        ol-debug=*)
+            OL_DEBUG=${arg#ol-debug=}
+        ;;
+    esac
+done
+
+# Define basic configs
+OL_DEBUG=${OL_DEBUG:-0}
+OL_ENABLED=${OL_ENABLED:-0}
+OL_RESET=${OL_RESET:-0}
+OL_SECBOOT=${OL_SECBOOT:-0}
+OL_DEVICE=${OL_DEVICE:-tmpfs}
+OL_DEVARGS=${OL_DEVARGS:-defaults}
+OL_DEVPREFIX=${OL_DEVPREFIX:-}
+OL_DRIVER=${OL_DRIVER:-aufs}
+
+# Should we continue?
+if [ "$OL_ENABLED" = "0" ]; then
+    log "Disabled, skipping..."
+    exit 0
+fi
+
+# If debug, close splash screen and get the terminal to the foreground
+if [ "$OL_DEBUG" = "1" ]; then
+    # better error tracking
+    set -x
+
+    [ -x /sbin/usplash_write ] &&
+        /sbin/usplash_write "QUIT"
+
+    chvt 1
+fi
+
+# Also make sure the driver/module is loaded
+if ! modprobe -qb "$OL_DRIVER"; then
+    case $OL_DRIVER in
+        overlay)
+            OL_DRIVER="overlayfs"
+        ;;
+        overlayfs)
+            OL_DRIVER="overlay"
+        ;;
+    esac
+
+    modprobe -qb "$OL_DRIVER"
+        error "Missing module for $OL_DRIVER"
+fi
+
+# Setup our mount points
+ROOTRW=${RAMDSKMNT}/mnt/union/root/upper
+ROOTRO=${RAMDSKMNT}/mnt/union/root/lower
+BOOTRW=${ROOTMNT}/mnt/union/boot/upper
+BOOTRO=${ROOTMNT}/mnt/union/boot/lower
+
+ROOTORIG="$ROOTRO"
+BOOTORIG="$BOOTRO"
+ROOTOVERLAY="$ROOTRW"
+BOOTOVERLAY="$BOOTRW"
+
+debug "Variables:\n\n"\
+    "\tOL_DEBUG = $OL_DEBUG\n"\
+    "\tOL_ENABLED = $OL_ENABLED\n"\
+    "\tOL_RESET = $OL_RESET\n"\
+    "\tOL_SECBOOT = $OL_SECBOOT\n"\
+    "\tOL_DEVICE = $OL_DEVICE\n"\
+    "\tOL_DEVARGS = $OL_DEVARGS\n"\
+    "\tOL_DEVPREFIX = $OL_DEVPREFIX\n"\
+    "\tOL_DRIVER = $OL_DRIVER\n\n"\
+    "\tROOTMNT = $ROOTMNT\n"\
+    "\tBOOTMNT = $BOOTMNT\n\n"\
+    "\tROOTORIG = $ROOTORIG\n"\
+    "\tROOTOVERLAY = $ROOTOVERLAY\n"\
+    "\tBOOTORIG = $BOOTORIG\n"\
+    "\tBOOTOVERLAY = $BOOTOVERLAY\n"
+
+if [ -n "$OL_DEVPREFIX" -o "$OL_DRIVER" = "overlay" ]; then
+    ROOTRW="${ROOTRW}/${OL_DEVPREFIX:-entry}"
+
+    if [ "$OL_DRIVER" = "overlay" ]; then
+        BOOTRW="${ROOTRW}/entry"
+        BOOTWK="${BOOTRW}-work"
+        ROOTWK="${ROOTRW}-work"
+    fi
+fi
+
+# Some mount information variables
+case $OL_DRIVER in
+    overlay)
+        debug "Setting up driver 'overlay'\n"\
+            "\tUpper = $ROOTRW\n"\
+            "\tLower = $ROOTRO\n"\
+            "\tWork = $ROOTWK"
+
+        UNOPTBOOT="upperdir=$BOOTRW,lowerdir=$BOOTRO,workdir=$BOOTWK"
+        UNOPT="upperdir=$ROOTRW,lowerdir=$ROOTRO,workdir=$ROOTWK"
+        UNTYPE="overlay"
+    ;;
+
+    overlayfs)
+        debug "Setting up driver 'overlayfs'\n"\
+            "\tUpper = $ROOTRW\n"\
+            "\tLower = $ROOTRO"
+
+        UNOPTBOOT="upperdir=$BOOTRW,lowerdir=$BOOTRO"
+        UNOPT="upperdir=$ROOTRW,lowerdir=$ROOTRO"
+        UNTYPE="overlay"
+    ;;
+
+    *)
+        debug "Setting up driver 'aufs'\n"\
+            "\tUpper = $ROOTRW\n"\
+            "\tLower = $ROOTRO"
+
+        UNOPTBOOT="dirs=$BOOTRW=rw:$BOOTRO=ro"
+        UNOPT="dirs=$ROOTRW=rw:$ROOTRO=ro"
+        UNTYPE="aufs"
+
+        if ! grep -q " ${RAMDSKMNT}/tmp " /proc/mounts; then
+            # We need a tmpfs for Xino tables when using aufs
+            if [ -d ${RAMDSKMNT}/tmp ] || mkdir ${RAMDSKMNT}/tmp; then
+                mount -t tmpfs tmpfs ${RAMDSKMNT}/tmp
+            fi
+
+            if ! grep -q " ${RAMDSKMNT}/tmp " /proc/mounts; then
+                debug "Disabling xino on aufs"
+
+                UNOPTBOOT="${UNOPTBOOT},noxino"
+                UNOPT="${UNOPT},noxino"
+            fi
+        fi
+    ;;
+esac
+
+#
+# ================================================================
+# ----------------------------------------------------------------
+# Let's get started
+#
+
+debug "Setting up ramdisk mount directories for root and it's overlay"
+chkdirs $ROOTORIG $ROOTOVERLAY ||
+    error "Failed to setup some of the ramdisk mount directories"
+
+# Move the original root mount
+debug "Moving root mount point\n"\
+    "\t$ROOTMNT -> $ROOTORIG"
+
+mount --move $ROOTMNT $ROOTORIG ||
+    failed "Failed to move $ROOTMNT to $ROOTORIG"
+
+# Mount the overlay device
+if [ "$OL_DEVICE" = "tmpfs" ]; then
+    debug "Mounting tmpfs as overlay at $ROOTOVERLAY"
+    mount -t tmpfs tmpfs "$ROOTOVERLAY" ||
+        failed "Could not mount the overlay device '$OL_DEVICE'"
+
+else
+    debug "Looking up overlay device '$OL_DEVICE'"
+    OL_DEVICE=$(devfile $OL_DEVICE)
+
+    [ "$?" = "1" ] &&
+        failed "Could not find the overlay device file"
+
+    debug "Mounting $OL_DEVICE as overlay at $ROOTOVERLAY"
+    mount -o $OL_DEVARGS $OL_DEVICE "$ROOTOVERLAY" ||
+        failed "could not mount the overlay device '$OL_DEVICE'"
+
+    if [ "$OL_RESET" = "1" ]; then
+        debug "Reset option detected, clearing $ROOTOVERLAY"
+        rm -rf "$ROOTOVERLAY"/*
+    fi
+fi
+
+# Create folders for prefix and possibly work
+if [ "$ROOTRW" != "$ROOTOVERLAY" ]; then
+    debug "Device prefix '${ROOTRW#$ROOTOVERLAY}' detected, creating sub-directories"
+    chkdirs $ROOTRW $ROOTWK ||
+        error "Failed to create some of the prefix sub-directories"
+fi
+
+# Unite the two mount points
+debug "Setting up union mount\n"\
+    "\t[$ROOTRW + $ROOTRO] -> $ROOTMNT"
+
+mount -t $UNTYPE -o "$UNOPT" $UNTYPE $ROOTMNT ||
+    failed "Failed to setup union mount at $ROOTMNT"
+
+# Remove fstab entry for the original root mount
+debug "Removing root entry in the union fstab file"
+if grep -q ' / ' $ROOTMNT/etc/fstab; then
+    cat $ROOTMNT/etc/fstab | grep -v ' / ' > $ROOTMNT/etc/fstab.bak
+    mv -f $ROOTMNT/etc/fstab.bak $ROOTMNT/etc/fstab
+fi
+
+debug "Preparing to move root and overlay access to the union mount point"
+if chkdirs ${ROOTMNT}${ROOTORIG#$RAMDSKMNT} ${ROOTMNT}${ROOTOVERLAY#$RAMDSKMNT}; then
+    debug "Moving root and overlay access to the union mount point"
+    for dir in $ROOTORIG $ROOTOVERLAY; do
+        debug "\t$dir -> ${ROOTMNT}${dir#$RAMDSKMNT}"
+        mount --move "$dir" "${ROOTMNT}${dir#$RAMDSKMNT}" ||
+            log "Unable to move '${dir#$RAMDSKMNT}'"
+    done
+
+else
+    log "Failed to create the necessary directories, unable to move root and overlay access"
+fi
+
+#
+# ================================================================
+# ----------------------------------------------------------------
+# Let's deal with boot
+#
+
+# Check to see if we should stop here
+log "Checking SecBoot status"
+if [ "$OL_SECBOOT" != "1" ]; then
+    # Restore original fstab with /boot entries
+    [ -f ${ROOTMNT}/etc/fstab.orig ] &&
+        mv -f ${ROOTMNT}/etc/fstab.orig ${ROOTMNT}/etc/fstab
+
+    log "SecBoot is disabled, skipping..."
+
+    [ "$OL_DEBUG" = "1" ] &&
+        spawn
+
+    debug "Continuing system boot..."
+    exit 0
+fi
+
+# Create the directories that we need for the boot union
+debug "Setting up boot directories on the union mount point"
+chkdirs $BOOTORIG $BOOTOVERLAY ||
+    error "Failed to setup some of the boot directories"
+
+# Find the entry for the original boot device
+debug "Looking up original boot device in union fstab file"
+ENTRY="$(grep ' /boot ' ${ROOTMNT}/etc/fstab | grep -v '#' | sed 's/\s\+/ /g' )"
+
+# Setup the boot union
+if [ -n "$ENTRY" ]; then
+    BOOTTYPE=$(echo $ENTRY | cut -d ' ' -f 3)
+    BOOTOPT=$(echo $ENTRY | cut -d ' ' -f 4)
+    BOOTDEV=$(devfile "`echo $ENTRY | cut -d ' ' -f 1`")
+
+    debug "Found boot device\n"\
+        "\tDevice = $BOOTDEV\n"\
+        "\tType = $BOOTTYPE\n"\
+        "\tOptions = $BOOTOPT"
+
+    # Mount the original boot partition
+    debug "Mounting boot device '$BOOTDEV' at $BOOTORIG"
+    if [ -z "$BOOTDEV" ] || ! mount $BOOTDEV $BOOTORIG -t $BOOTTYPE -o "${BOOTOPT},ro"; then
+        error "Failed to mount boot device '$BOOTDEV'"
+    fi
+
+    # Now we need a tmpfs overlay for the boot
+    debug "Mounting 'tmpfs' as boot overlay at  $BOOTOVERLAY"
+    if ! mount -t tmpfs tmpfs $BOOTOVERLAY; then
+        umount $BOOTORIG
+        error "Failed to mount boot overlay device 'tmpfs'"
+    fi
+
+    # Create folders for prefix and possibly work
+    if [ "$ROOTRW" != "$ROOTOVERLAY" ]; then
+        debug "Boot device prefix '${BOOTRW#$BOOTOVERLAY}' detected, creating sub-directories"
+        if ! chkdirs $BOOTRW $BOOTWK; then
+            umount $BOOTORIG
+            error "Failed to create some of the boot prefix sub-directories"
+        fi
+    fi
+
+    # Unite the two mount points
+    debug "Setting up boot union mount\n"\
+        "\t[$BOOTRW + $BOOTRO] -> $BOOTMNT"
+
+    if ! mount -t $UNTYPE -o "$UNOPTBOOT" $UNTYPE $BOOTMNT; then
+        umount $BOOTORIG
+        umount $BOOTOVERLAY
+        error "Failed to setup boot union mount at $BOOTMNT"
+    fi
+
+    # This is mostly not needed, but it helps if some tool or program expects to find /boot/efi in /proc/mount
+    if grep -q ' /boot/efi ' ${ROOTMNT}/etc/fstab; then
+        debug "UEFI detected, mounting 'tmpfs' at $BOOTMNT/efi"
+        mount -t tmpfs tmpfs $BOOTMNT/efi ||
+            log "Failed to mount UEFI 'tmpfs'"
+    fi
+
+    # Remove /boot and (if exists) /boot/efi entries from union fstab
+    debug "Removing boot entries in the union fstab file"
+    if grep -qe '\s\/boot\(\/efi\)\?\s' $ROOTMNT/etc/fstab; then
+        cp -f ${ROOTMNT}/etc/fstab ${ROOTMNT}/etc/fstab.orig
+        grep -ve '\s\/boot\(\/efi\)\?\s' ${ROOTMNT}/etc/fstab.orig > ${ROOTMNT}/etc/fstab
+    fi
+
+else
+    error "Failed to locate original boot device"
+fi
+
+[ "$OL_DEBUG" = "1" ] &&
+    spawn
+
+# Boot the system
+debug "Continuing system boot..."
+exit 0
